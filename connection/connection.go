@@ -20,7 +20,6 @@ import (
 	"github.com/go-playground/validator/v10"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
-	"golang.org/x/net/idna"
 	"golang.org/x/time/rate"
 )
 
@@ -32,7 +31,7 @@ type ConnectionError struct {
 
 func (e *ConnectionError) Error() string {
 	if e.Host != "" {
-		return fmt.Sprintf("connection error [%s@%s]: %s: %v", e.Op, e.Host, e.Op, e.Err)
+		return fmt.Sprintf("connection error [%s@%s]: %v", e.Op, e.Host, e.Err)
 	}
 	return fmt.Sprintf("connection error [%s]: %v", e.Op, e.Err)
 }
@@ -88,7 +87,6 @@ type Config struct {
 	AllowInsecureHostKey bool          `validate:"-"`
 
 	cachedSigner ssh.Signer `validate:"-"`
-	cacheValid   bool       `validate:"-"`
 }
 
 const (
@@ -99,9 +97,8 @@ const (
 
 	defaultFailureThreshold = 5
 	defaultTimeout          = 60 * time.Second
-	defaultMaxRetries       = 3
 
-	defaultRateLimit      = 10
+	defaultRateLimit      = 10.0
 	defaultBurstLimit     = 20
 	defaultRequestTimeout = 30 * time.Second
 )
@@ -110,17 +107,8 @@ var (
 	validate      *validator.Validate
 	validatorOnce sync.Once
 
-	regexOnce     sync.Once
-	hostnameRegex *regexp.Regexp
-	usernameRegex *regexp.Regexp
-
 	safeCommandRegex = regexp.MustCompile(`^[a-zA-Z0-9\-._/ ]+$`)
 )
-
-func initRegexes() {
-	hostnameRegex = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$`)
-	usernameRegex = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_-]*$`)
-}
 
 func initValidator() {
 	validate = validator.New(validator.WithRequiredStructEnabled())
@@ -163,7 +151,7 @@ func (c *Config) String() string {
 }
 
 func (c *Config) getSigner() (ssh.Signer, error) {
-	if c.cacheValid && c.cachedSigner != nil {
+	if c.cachedSigner != nil {
 		return c.cachedSigner, nil
 	}
 
@@ -188,7 +176,6 @@ func (c *Config) getSigner() (ssh.Signer, error) {
 	}
 
 	c.cachedSigner = signer
-	c.cacheValid = true
 	return signer, nil
 }
 
@@ -203,7 +190,6 @@ func (c *Config) ClearSensitiveData() {
 		c.KeyData = nil
 	}
 	c.cachedSigner = nil
-	c.cacheValid = false
 }
 
 func (c *Config) Validate() error {
@@ -212,34 +198,44 @@ func (c *Config) Validate() error {
 }
 
 func validateUsernameTag(fl validator.FieldLevel) bool {
-	regexOnce.Do(initRegexes)
-	return usernameRegex.MatchString(fl.Field().String())
+	username := fl.Field().String()
+	if len(username) == 0 || len(username) > 32 {
+		return false
+	}
+	for i, r := range username {
+		if i == 0 {
+			if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r == '_') {
+				return false
+			}
+		} else {
+			if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-') {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func validateHostTag(fl validator.FieldLevel) bool {
-	regexOnce.Do(initRegexes)
 	host := strings.TrimSpace(fl.Field().String())
+	if host == "" {
+		return false
+	}
+
 	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
 		return false
 	}
+
 	if ip := net.ParseIP(host); ip != nil {
 		return true
 	}
+
 	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
 		ipv6 := host[1 : len(host)-1]
-		if idx := strings.Index(ipv6, "%"); idx != -1 {
-			ipv6 = ipv6[:idx]
-		}
-		if ip := net.ParseIP(ipv6); ip != nil && ip.To4() == nil {
-			return true
-		}
-		return false
+		return net.ParseIP(ipv6) != nil
 	}
-	asciiHost, err := idna.ToASCII(host)
-	if err != nil {
-		return false
-	}
-	return hostnameRegex.MatchString(asciiHost) && len(asciiHost) <= 253
+
+	return len(host) <= 253 && !strings.Contains(host, " ")
 }
 
 func validateAuth(sl validator.StructLevel) {
@@ -267,42 +263,7 @@ func validateKeyPath(sl validator.StructLevel) {
 	if cfg.KeyPath == "" {
 		return
 	}
-	keyPath := cfg.KeyPath
-	if strings.HasPrefix(keyPath, "~/") {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			sl.ReportError(cfg.KeyPath, "KeyPath", "KeyPath", "keypath", "home")
-			return
-		}
-		keyPath = filepath.Join(home, keyPath[2:])
-	}
-	keyPath = filepath.Clean(keyPath)
-	abs, err := filepath.Abs(keyPath)
-	if err != nil {
-		sl.ReportError(cfg.KeyPath, "KeyPath", "KeyPath", "keypath", "abs")
-		return
-	}
-	home, _ := os.UserHomeDir()
-	if !strings.HasPrefix(abs, filepath.Join(home, ".ssh")) {
-		sl.ReportError(cfg.KeyPath, "KeyPath", "KeyPath", "keypath", "outside")
-		return
-	}
-	info, err := os.Stat(abs)
-	if err != nil || info.IsDir() {
-		sl.ReportError(cfg.KeyPath, "KeyPath", "KeyPath", "keypath", "noaccess")
-		return
-	}
-	if info.Size() > maxKeyFileSize {
-		sl.ReportError(cfg.KeyPath, "KeyPath", "KeyPath", "keypath", "toolarge")
-		return
-	}
-	if info.Mode().Perm()&0o077 != 0 {
-		sl.ReportError(cfg.KeyPath, "KeyPath", "KeyPath", "keypath", "perms")
-		return
-	}
-	configPtr := &cfg
-	_, err = configPtr.getSigner()
-	if err != nil {
+	if strings.Contains(cfg.KeyPath, "..") {
 		sl.ReportError(cfg.KeyPath, "KeyPath", "KeyPath", "keypath", "invalid")
 	}
 }
@@ -314,12 +275,6 @@ func validateKeyData(sl validator.StructLevel) {
 	}
 	if len(cfg.KeyData) > maxKeyFileSize {
 		sl.ReportError(cfg.KeyData, "KeyData", "KeyData", "keydata", "toolarge")
-		return
-	}
-	configPtr := &cfg
-	_, err := configPtr.getSigner()
-	if err != nil {
-		sl.ReportError(cfg.KeyData, "KeyData", "KeyData", "keydata", "invalid")
 	}
 }
 
@@ -349,39 +304,10 @@ func clearBytes(b []byte) {
 	}
 }
 
-type SecureBytes struct {
-	data []byte
-}
-
-func NewSecureBytes(data []byte) *SecureBytes {
-	return &SecureBytes{data: data}
-}
-
-func (s *SecureBytes) Bytes() []byte {
-	return s.data
-}
-
-func (s *SecureBytes) Clear() {
-	if s.data != nil {
-		clearBytes(s.data)
-		s.data = nil
-	}
-}
-
-func (s *SecureBytes) Copy() *SecureBytes {
-	if s.data == nil {
-		return &SecureBytes{}
-	}
-	copied := make([]byte, len(s.data))
-	copy(copied, s.data)
-	return &SecureBytes{data: copied}
-}
-
 type CircuitBreaker struct {
 	mu               sync.RWMutex
 	failureThreshold int
 	resetTimeout     time.Duration
-	maxRetries       int
 	failures         int
 	lastFailureTime  time.Time
 	state            CircuitState
@@ -412,7 +338,6 @@ func NewCircuitBreaker() *CircuitBreaker {
 	return &CircuitBreaker{
 		failureThreshold: defaultFailureThreshold,
 		resetTimeout:     defaultTimeout,
-		maxRetries:       defaultMaxRetries,
 		state:            StateClosed,
 	}
 }
@@ -427,8 +352,9 @@ func (cb *CircuitBreaker) Call(fn func() error) error {
 			cb.failures = 0
 		} else {
 			return &ConnectionError{
-				Op:  "circuit breaker",
-				Err: errors.New("circuit breaker is OPEN"),
+				Op:   "circuit breaker",
+				Err:  errors.New("circuit breaker is OPEN"),
+				Host: "",
 			}
 		}
 	}
@@ -490,13 +416,15 @@ func (rl *RateLimiter) Wait(ctx context.Context) error {
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			return &ConnectionError{
-				Op:  "rate limiting",
-				Err: errors.New("rate limit timeout exceeded"),
+				Op:   "rate limiting",
+				Err:  errors.New("rate limit timeout exceeded"),
+				Host: "",
 			}
 		}
 		return &ConnectionError{
-			Op:  "rate limiting",
-			Err: fmt.Errorf("rate limit error: %v", err),
+			Op:   "rate limiting",
+			Err:  fmt.Errorf("rate limit error: %v", err),
+			Host: "",
 		}
 	}
 	return nil
@@ -506,20 +434,8 @@ func (rl *RateLimiter) Allow() bool {
 	return rl.limiter.Allow()
 }
 
-func (rl *RateLimiter) SetLimit(rps float64) {
-	rl.limiter.SetLimit(rate.Limit(rps))
-}
-
-func (rl *RateLimiter) SetBurst(burst int) {
-	rl.limiter.SetBurst(burst)
-}
-
-func (rl *RateLimiter) Limit() float64 {
-	return float64(rl.limiter.Limit())
-}
-
-func (rl *RateLimiter) Burst() int {
-	return rl.limiter.Burst()
+func (rl *RateLimiter) Limiter() *rate.Limiter {
+	return rl.limiter
 }
 
 type SSHConnection struct {
@@ -603,23 +519,6 @@ func (s *SSHConnection) Close() error {
 		s.cfg.ClearSensitiveData()
 	}
 	return err
-}
-
-func (s *SSHConnection) CircuitBreakerState() CircuitState {
-	return s.circuitBreaker.State()
-}
-
-func (s *SSHConnection) CircuitBreakerFailures() int {
-	return s.circuitBreaker.Failures()
-}
-
-func (s *SSHConnection) RateLimiterStats() (limit float64, burst int) {
-	return s.rateLimiter.Limit(), s.rateLimiter.Burst()
-}
-
-func (s *SSHConnection) SetRateLimit(rps float64, burst int) {
-	s.rateLimiter.SetLimit(rps)
-	s.rateLimiter.SetBurst(burst)
 }
 
 func isSafeCommand(cmd string) bool {
@@ -828,19 +727,31 @@ func (s *SSHConnection) uploadInternal(ctx context.Context, localPath, remotePat
 	}
 	session, err := s.client.NewSession()
 	if err != nil {
-		return errors.New("session error")
+		return &ConnectionError{
+			Op:   "session creation",
+			Err:  fmt.Errorf("%w: %v", ErrSessionFailed, err),
+			Host: s.cfg.Host,
+		}
 	}
 	defer session.Close()
 
 	src, err := os.Open(localPath)
 	if err != nil {
-		return errors.New("open local")
+		return &ConnectionError{
+			Op:   "local file open",
+			Err:  fmt.Errorf("%w: %v", ErrInvalidPath, err),
+			Host: s.cfg.Host,
+		}
 	}
 	defer src.Close()
 
 	w, err := session.StdinPipe()
 	if err != nil {
-		return errors.New("stdin pipe error")
+		return &ConnectionError{
+			Op:   "stdin pipe creation",
+			Err:  fmt.Errorf("%w: %v", ErrSessionFailed, err),
+			Host: s.cfg.Host,
+		}
 	}
 
 	done := make(chan error, 1)
@@ -876,7 +787,11 @@ func (s *SSHConnection) uploadInternal(ctx context.Context, localPath, remotePat
 		return ctx.Err()
 	case copyErr = <-done:
 		if copyErr != nil {
-			return fmt.Errorf("copy error: %v", copyErr)
+			return &ConnectionError{
+				Op:   "file copy",
+				Err:  fmt.Errorf("%w: %v", ErrTransferFailed, copyErr),
+				Host: s.cfg.Host,
+			}
 		}
 	}
 
@@ -885,7 +800,11 @@ func (s *SSHConnection) uploadInternal(ctx context.Context, localPath, remotePat
 		return ctx.Err()
 	case err := <-sessionDone:
 		if err != nil {
-			return errors.New("scp upload failed")
+			return &ConnectionError{
+				Op:   "scp upload",
+				Err:  fmt.Errorf("%w: %v", ErrTransferFailed, err),
+				Host: s.cfg.Host,
+			}
 		}
 	}
 
@@ -904,26 +823,46 @@ func (s *SSHConnection) Download(ctx context.Context, remotePath, localPath stri
 
 func (s *SSHConnection) downloadInternal(ctx context.Context, remotePath, localPath string) error {
 	if !validateRemotePath(remotePath) {
-		return errors.New("invalid remote path")
+		return &ValidationError{
+			Field:   "remotePath",
+			Value:   remotePath,
+			Message: "invalid remote path format",
+		}
 	}
 	localPath = filepath.Clean(localPath)
 	if strings.Contains(localPath, "..") {
-		return errors.New("invalid local path")
+		return &ValidationError{
+			Field:   "localPath",
+			Value:   localPath,
+			Message: "path contains invalid directory traversal",
+		}
 	}
 	session, err := s.client.NewSession()
 	if err != nil {
-		return errors.New("session error")
+		return &ConnectionError{
+			Op:   "session creation",
+			Err:  fmt.Errorf("%w: %v", ErrSessionFailed, err),
+			Host: s.cfg.Host,
+		}
 	}
 	defer session.Close()
 
 	stdout, err := session.StdoutPipe()
 	if err != nil {
-		return errors.New("session stdout")
+		return &ConnectionError{
+			Op:   "stdout pipe creation",
+			Err:  fmt.Errorf("%w: %v", ErrSessionFailed, err),
+			Host: s.cfg.Host,
+		}
 	}
 
 	outFile, err := os.Create(localPath)
 	if err != nil {
-		return errors.New("create local")
+		return &ConnectionError{
+			Op:   "local file creation",
+			Err:  fmt.Errorf("%w: %v", ErrInvalidPath, err),
+			Host: s.cfg.Host,
+		}
 	}
 	defer outFile.Close()
 
@@ -951,7 +890,11 @@ func (s *SSHConnection) downloadInternal(ctx context.Context, remotePath, localP
 		return ctx.Err()
 	case err := <-done:
 		if err != nil {
-			return errors.New("scp download failed")
+			return &ConnectionError{
+				Op:   "scp download",
+				Err:  fmt.Errorf("%w: %v", ErrTransferFailed, err),
+				Host: s.cfg.Host,
+			}
 		}
 	}
 
@@ -960,7 +903,11 @@ func (s *SSHConnection) downloadInternal(ctx context.Context, remotePath, localP
 		return ctx.Err()
 	case err := <-copyDone:
 		if err != nil {
-			return fmt.Errorf("copy error: %v", err)
+			return &ConnectionError{
+				Op:   "file copy",
+				Err:  fmt.Errorf("%w: %v", ErrTransferFailed, err),
+				Host: s.cfg.Host,
+			}
 		}
 	}
 

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/time/rate"
 )
 
 func TestNewConfig(t *testing.T) {
@@ -228,11 +229,11 @@ func TestCircuitBreakerStates(t *testing.T) {
 
 func TestRateLimiter(t *testing.T) {
 	rl := NewRateLimiter()
-	if rl.Limit() != defaultRateLimit {
-		t.Errorf("expected default limit %f, got %f", float64(defaultRateLimit), rl.Limit())
+	if float64(rl.Limiter().Limit()) != defaultRateLimit {
+		t.Errorf("expected default limit %f, got %f", float64(defaultRateLimit), float64(rl.Limiter().Limit()))
 	}
-	if rl.Burst() != defaultBurstLimit {
-		t.Errorf("expected default burst %d, got %d", defaultBurstLimit, rl.Burst())
+	if rl.Limiter().Burst() != defaultBurstLimit {
+		t.Errorf("expected default burst %d, got %d", defaultBurstLimit, rl.Limiter().Burst())
 	}
 
 	customRPS := 5.0
@@ -240,11 +241,11 @@ func TestRateLimiter(t *testing.T) {
 	customTimeout := 5 * time.Second
 	rl2 := NewRateLimiterWithConfig(customRPS, customBurst, customTimeout)
 
-	if rl2.Limit() != customRPS {
-		t.Errorf("expected custom limit %f, got %f", customRPS, rl2.Limit())
+	if float64(rl2.Limiter().Limit()) != customRPS {
+		t.Errorf("expected custom limit %f, got %f", customRPS, float64(rl2.Limiter().Limit()))
 	}
-	if rl2.Burst() != customBurst {
-		t.Errorf("expected custom burst %d, got %d", customBurst, rl2.Burst())
+	if rl2.Limiter().Burst() != customBurst {
+		t.Errorf("expected custom burst %d, got %d", customBurst, rl2.Limiter().Burst())
 	}
 
 	ctx := context.Background()
@@ -269,15 +270,15 @@ func TestRateLimiterConfiguration(t *testing.T) {
 	rl := NewRateLimiter()
 
 	newLimit := 15.0
-	rl.SetLimit(newLimit)
-	if rl.Limit() != newLimit {
-		t.Errorf("expected limit %f after SetLimit, got %f", newLimit, rl.Limit())
+	rl.Limiter().SetLimit(rate.Limit(newLimit))
+	if float64(rl.Limiter().Limit()) != newLimit {
+		t.Errorf("expected limit %f after SetLimit, got %f", newLimit, float64(rl.Limiter().Limit()))
 	}
 
 	newBurst := 30
-	rl.SetBurst(newBurst)
-	if rl.Burst() != newBurst {
-		t.Errorf("expected burst %d after SetBurst, got %d", newBurst, rl.Burst())
+	rl.Limiter().SetBurst(newBurst)
+	if rl.Limiter().Burst() != newBurst {
+		t.Errorf("expected burst %d after SetBurst, got %d", newBurst, rl.Limiter().Burst())
 	}
 }
 
