@@ -150,6 +150,51 @@ func TestConfigValidate(t *testing.T) {
 			},
 			wantErr: false,
 		},
+		{
+			name: "valid config with IPv6 address",
+			config: &Config{
+				Host:     "[::1]",
+				Port:     22,
+				User:     "testuser",
+				Password: "test",
+				Timeout:  30 * time.Second,
+			},
+			wantErr: false,
+		},
+		{
+			name: "invalid host with port included",
+			config: &Config{
+				Host:     "example.com:22",
+				Port:     22,
+				User:     "testuser",
+				Password: "test",
+				Timeout:  30 * time.Second,
+			},
+			wantErr: true,
+		},
+		{
+			name: "username too long",
+			config: &Config{
+				Host:     "example.com",
+				Port:     22,
+				User:     "thisusernameiswaytoolongtobevalid",
+				Password: "test",
+				Timeout:  30 * time.Second,
+			},
+			wantErr: true,
+		},
+		{
+			name: "multiple authentication methods",
+			config: &Config{
+				Host:     "example.com",
+				Port:     22,
+				User:     "testuser",
+				Password: "test",
+				KeyPath:  "/path/to/key",
+				Timeout:  30 * time.Second,
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -218,5 +263,48 @@ func TestConfigString(t *testing.T) {
 	}
 	if !strings.Contains(str, "example.com") {
 		t.Error("Config.String() should contain host")
+	}
+}
+
+func TestConfigAuthMethod(t *testing.T) {
+	tests := []struct {
+		name     string
+		config   *Config
+		expected string
+	}{
+		{
+			name: "password auth",
+			config: &Config{
+				Password: "test",
+			},
+			expected: "password",
+		},
+		{
+			name: "keyfile auth",
+			config: &Config{
+				KeyPath: "/path/to/key",
+			},
+			expected: "keyfile",
+		},
+		{
+			name: "keydata auth",
+			config: &Config{
+				KeyData: []byte("-----BEGIN PRIVATE KEY-----\ndata\n-----END PRIVATE KEY-----"),
+			},
+			expected: "keydata",
+		},
+		{
+			name:     "no auth",
+			config:   &Config{},
+			expected: "none",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.config.AuthMethod(); got != tt.expected {
+				t.Errorf("Config.AuthMethod() = %v, want %v", got, tt.expected)
+			}
+		})
 	}
 }
