@@ -39,6 +39,10 @@ type SSHConnection struct {
 }
 
 func NewSSHConnection(cfg *Config) (*SSHConnection, error) {
+	return NewSSHConnectionWithRetry(cfg, nil)
+}
+
+func NewSSHConnectionWithRetry(cfg *Config, retryConfig *RetryConfig) (*SSHConnection, error) {
 	if cfg == nil {
 		return nil, &ValidationError{Field: "config", Message: "config cannot be nil"}
 	}
@@ -46,6 +50,22 @@ func NewSSHConnection(cfg *Config) (*SSHConnection, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidConfig, err)
 	}
+
+	if retryConfig == nil {
+		retryConfig = NewRetryConfig()
+	}
+
+	var conn *SSHConnection
+	err := WithRetry(context.Background(), retryConfig, func() error {
+		var connectErr error
+		conn, connectErr = createSSHConnection(cfg)
+		return connectErr
+	})
+
+	return conn, err
+}
+
+func createSSHConnection(cfg *Config) (*SSHConnection, error) {
 	authMethods := []ssh.AuthMethod{}
 	if cfg.Password != "" {
 		authMethods = append(authMethods, ssh.Password(cfg.Password))
