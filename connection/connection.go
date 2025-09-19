@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/go-playground/validator/v10"
+	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 	"golang.org/x/time/rate"
@@ -85,28 +86,24 @@ type Config struct {
 	Timeout              time.Duration `validate:"min=1s,max=10m"`
 	KnownHostsPath       string        `validate:"omitempty"`
 	AllowInsecureHostKey bool          `validate:"-"`
-
-	cachedSigner ssh.Signer `validate:"-"`
+	cachedSigner         ssh.Signer    `validate:"-"`
 }
 
 const (
-	maxOutputSize   = 10 * 1024 * 1024
-	maxKeyFileSize  = 32 * 1024
-	bufferSize      = 64 * 1024
-	maxTransferSize = 100 * 1024 * 1024
-
+	maxOutputSize         = 10 * 1024 * 1024
+	maxKeyFileSize        = 32 * 1024
+	bufferSize            = 64 * 1024
+	maxTransferSize       = 100 * 1024 * 1024
 	defaultFailureThreshold = 5
 	defaultTimeout          = 60 * time.Second
-
-	defaultRateLimit      = 10.0
-	defaultBurstLimit     = 20
-	defaultRequestTimeout = 30 * time.Second
+	defaultRateLimit        = 10.0
+	defaultBurstLimit       = 20
+	defaultRequestTimeout   = 30 * time.Second
 )
 
 var (
 	validate      *validator.Validate
 	validatorOnce sync.Once
-
 	safeCommandRegex = regexp.MustCompile(`^[a-zA-Z0-9\-._/ ]+$`)
 )
 
@@ -154,10 +151,8 @@ func (c *Config) getSigner() (ssh.Signer, error) {
 	if c.cachedSigner != nil {
 		return c.cachedSigner, nil
 	}
-
 	var data []byte
 	var err error
-
 	if len(c.KeyData) > 0 {
 		data = c.KeyData
 	} else if c.KeyPath != "" {
@@ -169,12 +164,10 @@ func (c *Config) getSigner() (ssh.Signer, error) {
 	} else {
 		return nil, errors.New("no key data available")
 	}
-
 	signer, err := parsePrivateKey(data)
 	if err != nil {
 		return nil, err
 	}
-
 	c.cachedSigner = signer
 	return signer, nil
 }
@@ -221,20 +214,16 @@ func validateHostTag(fl validator.FieldLevel) bool {
 	if host == "" {
 		return false
 	}
-
 	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
 		return false
 	}
-
 	if ip := net.ParseIP(host); ip != nil {
 		return true
 	}
-
 	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
 		ipv6 := host[1 : len(host)-1]
 		return net.ParseIP(ipv6) != nil
 	}
-
 	return len(host) <= 253 && !strings.Contains(host, " ")
 }
 
@@ -345,7 +334,6 @@ func NewCircuitBreaker() *CircuitBreaker {
 func (cb *CircuitBreaker) Call(fn func() error) error {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
-
 	if cb.state == StateOpen {
 		if time.Since(cb.lastFailureTime) > cb.resetTimeout {
 			cb.state = StateHalfOpen
@@ -358,18 +346,15 @@ func (cb *CircuitBreaker) Call(fn func() error) error {
 			}
 		}
 	}
-
 	err := fn()
 	if err != nil {
 		cb.failures++
 		cb.lastFailureTime = time.Now()
-
 		if cb.failures >= cb.failureThreshold {
 			cb.state = StateOpen
 		}
 		return err
 	}
-
 	if cb.state == StateHalfOpen {
 		cb.state = StateClosed
 	}
@@ -411,7 +396,6 @@ func NewRateLimiterWithConfig(rps float64, burst int, timeout time.Duration) *Ra
 func (rl *RateLimiter) Wait(ctx context.Context) error {
 	waitCtx, cancel := context.WithTimeout(ctx, rl.timeout)
 	defer cancel()
-
 	err := rl.limiter.Wait(waitCtx)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -440,6 +424,7 @@ func (rl *RateLimiter) Limiter() *rate.Limiter {
 
 type SSHConnection struct {
 	client         *ssh.Client
+	sftpClient     *sftp.Client
 	cfg            *Config
 	circuitBreaker *CircuitBreaker
 	rateLimiter    *RateLimiter
@@ -453,7 +438,6 @@ func NewSSHConnection(cfg *Config) (*SSHConnection, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidConfig, err)
 	}
-
 	authMethods := []ssh.AuthMethod{}
 	if cfg.Password != "" {
 		authMethods = append(authMethods, ssh.Password(cfg.Password))
@@ -469,7 +453,6 @@ func NewSSHConnection(cfg *Config) (*SSHConnection, error) {
 		}
 		authMethods = append(authMethods, ssh.PublicKeys(signer))
 	}
-
 	hostKeyCallback := ssh.InsecureIgnoreHostKey()
 	if !cfg.AllowInsecureHostKey {
 		if cfg.KnownHostsPath == "" {
@@ -488,14 +471,12 @@ func NewSSHConnection(cfg *Config) (*SSHConnection, error) {
 		}
 		hostKeyCallback = callback
 	}
-
 	sshCfg := &ssh.ClientConfig{
 		User:            cfg.User,
 		Auth:            authMethods,
 		HostKeyCallback: hostKeyCallback,
 		Timeout:         cfg.Timeout,
 	}
-
 	addr := net.JoinHostPort(cfg.Host, fmt.Sprintf("%d", cfg.Port))
 	client, err := ssh.Dial("tcp", addr, sshCfg)
 	if err != nil {
@@ -505,8 +486,13 @@ func NewSSHConnection(cfg *Config) (*SSHConnection, error) {
 			Host: cfg.Host,
 		}
 	}
+	var sftpClient *sftp.Client
+	if sftpC, err := sftp.NewClient(client); err == nil {
+		sftpClient = sftpC
+	}
 	return &SSHConnection{
 		client:         client,
+		sftpClient:     sftpClient,
 		cfg:            cfg,
 		circuitBreaker: NewCircuitBreaker(),
 		rateLimiter:    NewRateLimiter(),
@@ -514,6 +500,9 @@ func NewSSHConnection(cfg *Config) (*SSHConnection, error) {
 }
 
 func (s *SSHConnection) Close() error {
+	if s.sftpClient != nil {
+		_ = s.sftpClient.Close()
+	}
 	err := s.client.Close()
 	if s.cfg != nil {
 		s.cfg.ClearSensitiveData()
@@ -547,15 +536,12 @@ func (s *SSHConnection) ExecuteArgs(ctx context.Context, cmd string, args ...str
 	if err := s.rateLimiter.Wait(ctx); err != nil {
 		return nil, err
 	}
-
 	var result *Result
 	var execErr error
-
 	err := s.circuitBreaker.Call(func() error {
 		result, execErr = s.executeArgsInternal(ctx, cmd, args...)
 		return execErr
 	})
-
 	if err != nil {
 		return nil, err
 	}
@@ -572,7 +558,6 @@ func (s *SSHConnection) executeArgsInternal(ctx context.Context, cmd string, arg
 		}
 	}
 	defer session.Close()
-
 	stdout, err := session.StdoutPipe()
 	if err != nil {
 		return nil, &ConnectionError{
@@ -589,7 +574,6 @@ func (s *SSHConnection) executeArgsInternal(ctx context.Context, cmd string, arg
 			Host: s.cfg.Host,
 		}
 	}
-
 	cmdline := cmd
 	if len(args) > 0 {
 		parts := make([]string, 0, len(args)+1)
@@ -607,20 +591,17 @@ func (s *SSHConnection) executeArgsInternal(ctx context.Context, cmd string, arg
 			Host: s.cfg.Host,
 		}
 	}
-
 	outBuf := &strings.Builder{}
 	errBuf := &strings.Builder{}
-
 	var wg sync.WaitGroup
 	var copyErr error
-
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
 		limitedStdout := &io.LimitedReader{R: stdout, N: maxOutputSize}
 		bufferedReader := bufio.NewReaderSize(limitedStdout, bufferSize)
 		if _, err := io.Copy(outBuf, bufferedReader); err != nil {
-			copyErr = err
+			copyErr = fmt.Errorf("stdout copy error: %v", err)
 		}
 	}()
 	go func() {
@@ -628,288 +609,197 @@ func (s *SSHConnection) executeArgsInternal(ctx context.Context, cmd string, arg
 		limitedStderr := &io.LimitedReader{R: stderr, N: maxOutputSize}
 		bufferedReader := bufio.NewReaderSize(limitedStderr, bufferSize)
 		if _, err := io.Copy(errBuf, bufferedReader); err != nil {
-			copyErr = err
+			copyErr = fmt.Errorf("stderr copy error: %v", err)
 		}
 	}()
-
 	done := make(chan error, 1)
-	go func() {
-		done <- session.Wait()
-	}()
-
-	var sessionErr error
+	go func() { done <- session.Wait() }()
 	select {
 	case <-ctx.Done():
-		_ = session.Signal(ssh.SIGKILL)
-		wg.Wait()
-		return nil, ctx.Err()
-	case sessionErr = <-done:
-		wg.Wait()
-	}
-
-	if copyErr != nil {
+		session.Signal(ssh.SIGKILL)
 		return nil, &ConnectionError{
-			Op:   "output copy",
-			Err:  fmt.Errorf("%w: %v", ErrCommandFailed, copyErr),
+			Op:   "command execution",
+			Err:  fmt.Errorf("%w: command timed out: %v", ErrCommandFailed, ctx.Err()),
 			Host: s.cfg.Host,
 		}
-	}
-
-	exitCode := 0
-	if sessionErr != nil {
-		if exitError, ok := sessionErr.(*ssh.ExitError); ok {
-			exitCode = exitError.ExitStatus()
-		} else {
-			exitCode = 1
+	case err := <-done:
+		wg.Wait()
+		if copyErr != nil {
+			return nil, &ConnectionError{
+				Op:   "output copy",
+				Err:  fmt.Errorf("%w: %v", ErrCommandFailed, copyErr),
+				Host: s.cfg.Host,
+			}
 		}
+		exitCode := 0
+		if err != nil {
+			if exitErr, ok := err.(*ssh.ExitError); ok {
+				exitCode = exitErr.ExitStatus()
+			} else {
+				return nil, &ConnectionError{
+					Op:   "command execution",
+					Err:  fmt.Errorf("%w: %v", ErrCommandFailed, err),
+					Host: s.cfg.Host,
+				}
+			}
+		}
+		return &Result{
+			Stdout:   outBuf.String(),
+			Stderr:   errBuf.String(),
+			ExitCode: exitCode,
+		}, nil
 	}
-
-	return &Result{
-		Stdout:   outBuf.String(),
-		Stderr:   errBuf.String(),
-		ExitCode: exitCode,
-	}, nil
-}
-
-func validateRemotePath(p string) bool {
-	if p == "" {
-		return false
-	}
-	if !filepath.IsAbs(p) {
-		return false
-	}
-	if strings.Contains(p, "..") {
-		return false
-	}
-	return true
 }
 
 func (s *SSHConnection) Upload(ctx context.Context, localPath, remotePath string, mode fs.FileMode) error {
 	if err := s.rateLimiter.Wait(ctx); err != nil {
 		return err
 	}
-
 	return s.circuitBreaker.Call(func() error {
+		if s.sftpClient != nil {
+			return s.uploadSFTP(localPath, remotePath, mode)
+		}
 		return s.uploadInternal(ctx, localPath, remotePath, mode)
 	})
-}
-
-func (s *SSHConnection) uploadInternal(ctx context.Context, localPath, remotePath string, mode fs.FileMode) error {
-	localPath = filepath.Clean(localPath)
-	if !strings.HasPrefix(localPath, filepath.Clean(".")) && !filepath.IsAbs(localPath) {
-		return &ValidationError{
-			Field:   "localPath",
-			Value:   localPath,
-			Message: "path must be absolute or relative to current directory",
-		}
-	}
-	info, err := os.Stat(localPath)
-	if err != nil || info.IsDir() {
-		return &ConnectionError{
-			Op:   "local file access",
-			Err:  fmt.Errorf("%w: %v", ErrInvalidPath, err),
-			Host: s.cfg.Host,
-		}
-	}
-	if info.Size() > maxTransferSize {
-		return &ValidationError{
-			Field:   "fileSize",
-			Value:   info.Size(),
-			Message: fmt.Sprintf("file size %d exceeds maximum %d", info.Size(), maxTransferSize),
-		}
-	}
-	if !validateRemotePath(remotePath) {
-		return &ValidationError{
-			Field:   "remotePath",
-			Value:   remotePath,
-			Message: "invalid remote path format",
-		}
-	}
-	session, err := s.client.NewSession()
-	if err != nil {
-		return &ConnectionError{
-			Op:   "session creation",
-			Err:  fmt.Errorf("%w: %v", ErrSessionFailed, err),
-			Host: s.cfg.Host,
-		}
-	}
-	defer session.Close()
-
-	src, err := os.Open(localPath)
-	if err != nil {
-		return &ConnectionError{
-			Op:   "local file open",
-			Err:  fmt.Errorf("%w: %v", ErrInvalidPath, err),
-			Host: s.cfg.Host,
-		}
-	}
-	defer src.Close()
-
-	w, err := session.StdinPipe()
-	if err != nil {
-		return &ConnectionError{
-			Op:   "stdin pipe creation",
-			Err:  fmt.Errorf("%w: %v", ErrSessionFailed, err),
-			Host: s.cfg.Host,
-		}
-	}
-
-	done := make(chan error, 1)
-	go func() {
-		defer w.Close()
-		defer func() { done <- nil }()
-
-		if _, err := fmt.Fprintf(w, "C%04o %d %s\n", mode.Perm(), info.Size(), filepath.Base(remotePath)); err != nil {
-			done <- err
-			return
-		}
-		bufferedSrc := bufio.NewReaderSize(src, bufferSize)
-		if _, err := io.Copy(w, bufferedSrc); err != nil {
-			done <- err
-			return
-		}
-		if _, err := fmt.Fprint(w, "\x00"); err != nil {
-			done <- err
-			return
-		}
-	}()
-
-	var copyErr error
-	sessionDone := make(chan error, 1)
-	go func() {
-		sessionDone <- session.Run(fmt.Sprintf("scp -t %s", quoteArg(remotePath)))
-	}()
-
-	select {
-	case <-ctx.Done():
-		_ = session.Signal(ssh.SIGKILL)
-		<-done
-		return ctx.Err()
-	case copyErr = <-done:
-		if copyErr != nil {
-			return &ConnectionError{
-				Op:   "file copy",
-				Err:  fmt.Errorf("%w: %v", ErrTransferFailed, copyErr),
-				Host: s.cfg.Host,
-			}
-		}
-	}
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case err := <-sessionDone:
-		if err != nil {
-			return &ConnectionError{
-				Op:   "scp upload",
-				Err:  fmt.Errorf("%w: %v", ErrTransferFailed, err),
-				Host: s.cfg.Host,
-			}
-		}
-	}
-
-	return nil
 }
 
 func (s *SSHConnection) Download(ctx context.Context, remotePath, localPath string) error {
 	if err := s.rateLimiter.Wait(ctx); err != nil {
 		return err
 	}
-
 	return s.circuitBreaker.Call(func() error {
+		if s.sftpClient != nil {
+			return s.downloadSFTP(remotePath, localPath)
+		}
 		return s.downloadInternal(ctx, remotePath, localPath)
 	})
 }
 
-func (s *SSHConnection) downloadInternal(ctx context.Context, remotePath, localPath string) error {
-	if !validateRemotePath(remotePath) {
-		return &ValidationError{
-			Field:   "remotePath",
-			Value:   remotePath,
-			Message: "invalid remote path format",
-		}
+func (s *SSHConnection) uploadSFTP(localPath, remotePath string, mode fs.FileMode) error {
+	src, err := os.Open(localPath)
+	if err != nil {
+		return fmt.Errorf("open local file: %w", err)
 	}
-	localPath = filepath.Clean(localPath)
-	if strings.Contains(localPath, "..") {
-		return &ValidationError{
-			Field:   "localPath",
-			Value:   localPath,
-			Message: "path contains invalid directory traversal",
-		}
+	defer src.Close()
+	dst, err := s.sftpClient.Create(remotePath)
+	if err != nil {
+		return fmt.Errorf("create remote file: %w", err)
+	}
+	defer dst.Close()
+	if _, err := io.Copy(dst, src); err != nil {
+		return fmt.Errorf("copy to remote: %w", err)
+	}
+	return s.sftpClient.Chmod(remotePath, mode)
+}
+
+func (s *SSHConnection) downloadSFTP(remotePath, localPath string) error {
+	src, err := s.sftpClient.Open(remotePath)
+	if err != nil {
+		return fmt.Errorf("open remote file: %w", err)
+	}
+	defer src.Close()
+	dst, err := os.Create(localPath)
+	if err != nil {
+		return fmt.Errorf("create local file: %w", err)
+	}
+	defer dst.Close()
+	_, err = io.Copy(dst, src)
+	return err
+}
+
+func (s *SSHConnection) uploadInternal(ctx context.Context, localPath, remotePath string, mode fs.FileMode) error {
+	info, err := os.Stat(localPath)
+	if err != nil {
+		return fmt.Errorf("%w: cannot stat local file: %v", ErrInvalidPath, err)
+	}
+	if info.Size() > maxTransferSize {
+		return fmt.Errorf("%w: file too large (%d > %d bytes)",
+			ErrTransferFailed, info.Size(), maxTransferSize)
+	}
+	if strings.Contains(remotePath, "..") || strings.Contains(remotePath, "~") {
+		return fmt.Errorf("%w: invalid remote path", ErrInvalidPath)
 	}
 	session, err := s.client.NewSession()
 	if err != nil {
-		return &ConnectionError{
-			Op:   "session creation",
-			Err:  fmt.Errorf("%w: %v", ErrSessionFailed, err),
-			Host: s.cfg.Host,
-		}
+		return fmt.Errorf("%w: failed to create session: %v", ErrSessionFailed, err)
 	}
 	defer session.Close()
+	stdin, err := session.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("%w: failed to create stdin pipe: %v", ErrTransferFailed, err)
+	}
+	defer stdin.Close()
+	targetDir := filepath.Dir(remotePath)
+	baseName := filepath.Base(remotePath)
+	go func() {
+		defer stdin.Close()
+		fmt.Fprintf(stdin, "C%#o %d %s\n", mode.Perm(), info.Size(), baseName)
+		file, err := os.Open(localPath)
+		if err != nil {
+			return
+		}
+		defer file.Close()
+		if _, err := io.Copy(stdin, file); err != nil {
+			return
+		}
+		fmt.Fprint(stdin, "\x00")
+	}()
+	cmd := fmt.Sprintf("scp -t %s", quoteArg(targetDir))
+	if err := session.Run(cmd); err != nil {
+		return fmt.Errorf("%w: scp command failed: %v", ErrTransferFailed, err)
+	}
+	return nil
+}
 
+func (s *SSHConnection) downloadInternal(ctx context.Context, remotePath, localPath string) error {
+	if strings.Contains(remotePath, "..") || strings.Contains(remotePath, "~") {
+		return fmt.Errorf("%w: invalid remote path", ErrInvalidPath)
+	}
+	session, err := s.client.NewSession()
+	if err != nil {
+		return fmt.Errorf("%w: failed to create session: %v", ErrSessionFailed, err)
+	}
+	defer session.Close()
 	stdout, err := session.StdoutPipe()
 	if err != nil {
-		return &ConnectionError{
-			Op:   "stdout pipe creation",
-			Err:  fmt.Errorf("%w: %v", ErrSessionFailed, err),
-			Host: s.cfg.Host,
-		}
+		return fmt.Errorf("%w: failed to create stdout pipe: %v", ErrTransferFailed, err)
 	}
-
-	outFile, err := os.Create(localPath)
+	targetDir := filepath.Dir(remotePath)
+	baseName := filepath.Base(remotePath)
+	cmd := fmt.Sprintf("scp -f %s", quoteArg(remotePath))
+	localFile, err := os.Create(localPath)
 	if err != nil {
-		return &ConnectionError{
-			Op:   "local file creation",
-			Err:  fmt.Errorf("%w: %v", ErrInvalidPath, err),
-			Host: s.cfg.Host,
-		}
+		return fmt.Errorf("%w: failed to create local file: %v", ErrTransferFailed, err)
 	}
-	defer outFile.Close()
-
-	done := make(chan error, 1)
+	defer localFile.Close()
+	stdin, err := session.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("%w: failed to create stdin pipe: %v", ErrTransferFailed, err)
+	}
 	go func() {
-		done <- session.Run(fmt.Sprintf("scp -f %s", quoteArg(remotePath)))
+		defer stdin.Close()
+		fmt.Fprint(stdin, "\x00")
 	}()
-
-	copyDone := make(chan error, 1)
-	go func() {
-		limitedStdout := &io.LimitedReader{R: stdout, N: maxTransferSize}
-		bufferedReader := bufio.NewReaderSize(limitedStdout, bufferSize)
-		bufferedWriter := bufio.NewWriterSize(outFile, bufferSize)
-		_, err := io.Copy(bufferedWriter, bufferedReader)
-		if flushErr := bufferedWriter.Flush(); flushErr != nil && err == nil {
-			err = flushErr
-		}
-		copyDone <- err
-	}()
-
-	select {
-	case <-ctx.Done():
-		_ = session.Signal(ssh.SIGKILL)
-		<-copyDone
-		return ctx.Err()
-	case err := <-done:
-		if err != nil {
-			return &ConnectionError{
-				Op:   "scp download",
-				Err:  fmt.Errorf("%w: %v", ErrTransferFailed, err),
-				Host: s.cfg.Host,
+	if err := session.Start(cmd); err != nil {
+		return fmt.Errorf("%w: failed to start scp: %v", ErrTransferFailed, err)
+	}
+	buf := make([]byte, bufferSize)
+	for {
+		n, err := stdout.Read(buf)
+		if n > 0 {
+			if _, werr := localFile.Write(buf[:n]); werr != nil {
+				return fmt.Errorf("%w: write error: %v", ErrTransferFailed, werr)
 			}
 		}
-	}
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case err := <-copyDone:
+		if err == io.EOF {
+			break
+		}
 		if err != nil {
-			return &ConnectionError{
-				Op:   "file copy",
-				Err:  fmt.Errorf("%w: %v", ErrTransferFailed, err),
-				Host: s.cfg.Host,
-			}
+			return fmt.Errorf("%w: read error: %v", ErrTransferFailed, err)
 		}
 	}
-
+	if err := session.Wait(); err != nil {
+		return fmt.Errorf("%w: scp wait error: %v", ErrTransferFailed, err)
+	}
 	return nil
 }
